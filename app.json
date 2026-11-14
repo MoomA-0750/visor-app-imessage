@@ -1,0 +1,18 @@
+{
+  "id": "imessage",
+  "name": "iMessage",
+  "icon": "sms",
+  "description": "Mac で動く imsg-web につないで、iMessage の会話を読み、返事を打って送る。写真も見られる。新着は通知で知らせる",
+  "version": "0.1.0",
+  "kind": "process",
+  "command": "bin/visor-imessage.exe",
+  "build": ["dotnet", "publish", "-c", "Release", "-o", "bin", "--nologo"],
+  "autostart": true,
+  "width": 0.5,
+  "height": 1100,
+  "ornaments": {
+    "top": { "height": 92, "width": 900 },
+    "left": { "width": 460 },
+    "bottom": { "height": 92 }
+  }
+}
