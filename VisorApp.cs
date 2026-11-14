@@ -43,6 +43,9 @@ public sealed class VisorApp
     /// </summary>
     public event Action<string, string, bool>? Input;
 
+    /// <summary>ほかの窓（ファイル・ギャラリー・写真）から運んだファイルを、この窓に置かれた（ファイルの場所）。app.json に "drop": true が要る。</summary>
+    public event Action<IReadOnlyList<string>>? Drop;
+
     /// <summary>窓が見えるようになった・見えなくなった（見えていない間は更新を止めてよい）。</summary>
     public event Action<bool>? Visible;
 
@@ -183,6 +186,9 @@ public sealed class VisorApp
                     break;
                 case "input":
                     Input?.Invoke(msg["id"]?.GetValue<string>() ?? "", msg["text"]?.GetValue<string>() ?? "", msg["submit"]?.GetValue<bool>() == true);
+                    break;
+                case "drop":
+                    Drop?.Invoke((msg["files"] as JsonArray ?? []).Select(f => f?.GetValue<string>()).OfType<string>().ToList());
                     break;
                 case "visible":
                     IsVisible = msg["visible"]?.GetValue<bool>() == true;

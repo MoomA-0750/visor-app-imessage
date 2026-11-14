@@ -31,7 +31,19 @@ string? notice = null;
 var noticeError = false;
 var noticeUntil = DateTimeOffset.MinValue;
 var compose = "";
-var sending = false;
+// 添えるファイル（送るときに上げる）と、ファイルを選ぶ小窓
+var attached = new List<string>();
+var pickerOpen = false;
+var pickerTab = "photos";
+var pickerPage = 0;
+List<string>? pickerFiles = null;
+var pickerMore = false;
+const int MaxFiles = 10;
+const long MaxFileBytes = 100L * 1024 * 1024;
+string? sentPopup = null;
+
+// 送って、まだ会話に出てこないもの（すぐ吹き出しを出す）
+var pendings = new List<Pending>();
 
 // 設定の画面（つなぐ先が無ければ、はじめから出す）
 var settingsOpen = !config.Ready;
@@ -67,6 +79,12 @@ app.Input += (id, text, submit) =>
     }
     if (submit) _ = Connect();
 };
+// ほかの窓（ファイル・ギャラリー・写真）から運んで置いたファイルを添える
+app.Drop += files =>
+{
+    lock (gate) Attach(files);
+    Draw();
+};
 // 窓が見えたら、すぐ読み直す（見えていない間は 1 分おき、見えている間は 15 秒おき）
 app.Visible += on => { if (on) wake.Release(); };
 
@@ -98,8 +116,19 @@ app.Tool("send_message", "iMessage を送る（本人として送られ、取り
     if (chat == null) return T("その名前の会話が見つかりません", "No conversation with that name");
     var text = Str(a, "text") ?? "";
     if (text.Trim().Length == 0) return T("送る文がありません", "Nothing to send");
-    return await Send(Str(chat, "id")!, text);
+    var (outcome, answer) = await Send(Str(chat, "id")!, text);
+    return outcome == SendOutcome.Sent ? T("送りました", "Sent") : answer;
 }, ("name", "string"), ("text", "string"));
+app.Tool("send_file", "iMessage でファイル（写真など）を送る（本人として送られ、取り消せない）。本人がはっきり頼んだときだけ使い、送る前に相手とファイルを本人に確かめる。path はこの PC のファイルの場所（; で区切って 10 個まで）。text は添える文（無くてよい）。", async a =>
+{
+    var chat = await FindChat(Str(a, "name"));
+    if (chat == null) return T("その名前の会話が見つかりません", "No conversation with that name");
+    var files = (Str(a, "path") ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+    if (files.Count == 0) return T("送るファイルがありません", "No file to send");
+    if (files.FirstOrDefault(f => !File.Exists(f)) is { } missing) return T($"ファイルが見つかりません: {missing}", $"File not found: {missing}");
+    var (outcome, answer) = await Send(Str(chat, "id")!, Str(a, "text") ?? "", files);
+    return outcome == SendOutcome.Sent ? T("送りました", "Sent") : answer;
+}, ("name", "string"), ("path", "string"), ("text", "string"));
 app.Tool("open_chat", "iMessage の窓でその会話を開いて見せる。", async a =>
 {
     var chat = await FindChat(Str(a, "name"));
@@ -235,6 +264,7 @@ async Task LoadHistory(string id)
             if (selectedId != id) return;
             messages = list;
             historyFor = id;
+            if (selectedKey != null) SettlePendings(selectedKey, list);
             historyAt = chats.FirstOrDefault(x => Str(x, "id") == id) is { } sel ? Str(sel, "lastMessageAt") : null;
             foreach (var m in list.TakeLast(30))
             {
@@ -340,62 +370,143 @@ void Select(JsonObject chat)
 async Task SendText(string text)
 {
     string? id;
+    List<string> files;
     lock (gate)
     {
         id = selectedId;
-        if (sending || id == null || text.Trim().Length == 0) return;
+        files = [.. attached];
+        if (id == null || (text.Trim().Length == 0 && files.Count == 0)) return;
+        attached.Clear();
+        pickerOpen = false;
     }
-    var result = await Send(id, text);
-    // 送れなかったら、打った文を入力欄に戻す
-    if (result != "sent") app.SetInput("compose", text);
+    var (outcome, _) = await Send(id, text, files);
+    // 送っていないと分かっているときだけ、打った文と添えたファイルを戻す（「届いたか分からない」で戻すと、送り直して二重になる）
+    if (outcome == SendOutcome.NotSent)
+    {
+        if (text.Length > 0) app.SetInput("compose", text);
+        lock (gate) Attach(files);
+        Draw();
+    }
 }
 
-/// <summary>送って、本人に見せる文を返す（送れたら "sent"）。</summary>
-async Task<string> Send(string chatId, string text)
+/// <summary>添えるファイルを足す（同じものは足さない。10 個まで。大きすぎるものとフォルダは断る）。</summary>
+void Attach(IEnumerable<string> files)
 {
+    foreach (var f in files)
+    {
+        if (attached.Contains(f) || !File.Exists(f)) continue;
+        if (attached.Count >= MaxFiles)
+        {
+            Say(T($"ファイルは {MaxFiles} 個までです", $"Up to {MaxFiles} files"), true);
+            break;
+        }
+        if (new FileInfo(f).Length > MaxFileBytes)
+        {
+            Say(T($"{Path.GetFileName(f)} は大きすぎます（100MB まで）", $"{Path.GetFileName(f)} is too large (100 MB max)"), true);
+            continue;
+        }
+        attached.Add(f);
+        if (IsImage(f)) WantThumb(f);
+    }
+}
+
+/// <summary>送る。会話にはすぐ「送信中」の吹き出しを出し、届いたものが会話に出たら消す。本人に見せる文も返す。</summary>
+async Task<(SendOutcome, string)> Send(string chatId, string text, IReadOnlyList<string>? files = null)
+{
+    files ??= [];
     ImsgClient? c;
+    Pending pending;
     lock (gate)
     {
         c = client;
-        if (c == null) return T("imsg-web につなぐ設定がまだありません", "Not set up yet");
-        if (sendMode == "off") return T("このトークンでは送れません（読むだけのトークンです）", "This token can't send (it's read-only)");
-        sending = true;
+        if (c == null) return (SendOutcome.NotSent, T("imsg-web につなぐ設定がまだありません", "Not set up yet"));
+        if (sendMode == "off") return (SendOutcome.NotSent, T("このトークンでは送れません（読むだけのトークンです）", "This token can't send (it's read-only)"));
+        var chat = chats.FirstOrDefault(x => Str(x, "id") == chatId);
+        pending = new Pending(chat != null ? Key(chat) : chatId, text, DateTimeOffset.UtcNow, files.Count);
+        pendings.Add(pending);
     }
     Draw();
-    var body = new JsonObject { ["chatId"] = chatId, ["text"] = text };
+    var body = new JsonObject { ["chatId"] = chatId };
+    if (text.Trim().Length > 0) body["text"] = text;
+    SendOutcome outcome;
     string answer;
     try
     {
+        // ファイルは先に 1 つずつ上げる（上げるだけでは送られない。使わなければ 10 分で捨てられる）
+        if (files.Count > 0)
+        {
+            var ids = new JsonArray();
+            foreach (var f in files)
+            {
+                await using var stream = File.OpenRead(f);
+                ids.Add(await c.Upload(Path.GetFileName(f), stream));
+            }
+            body["uploadIds"] = ids;
+        }
         // imsg-web は 2 KiB より大きい中身を受けない
         if (Encoding.UTF8.GetByteCount(body.ToJsonString()) > 2000)
             throw new InvalidOperationException(T("文が長すぎます（日本語でおよそ 600 文字まで）。分けて送ってください", "The message is too long. Split it up"));
-        var res = await c.PostJson("api/send", body);
-        answer = Str(res, "state") switch
+        var res = await c.PostJson("api/send", body, timeout: TimeSpan.FromSeconds(75));
+        (outcome, answer) = Str(res, "state") switch
         {
-            "sent" => "sent",
-            "dry_run" => T("試しのモードなので、送ったことにして何も送っていません（imsg-web が dry-run）", "Dry-run mode: nothing was sent"),
-            "unknown" => T("届いたか分かりません。Messages で確かめてください（送り直すと二重になるかもしれません）", "It may or may not have gone. Check in Messages before sending again"),
-            _ => T("送れませんでした。もう一度送れます", "Couldn't send. You can try again"),
+            "sent" => (SendOutcome.Sent, T("送りました", "Sent")),
+            "dry_run" => (SendOutcome.NotSent, T("試しのモードなので、送ったことにして何も送っていません（imsg-web が dry-run）", "Dry-run mode: nothing was sent")),
+            "unknown" => (SendOutcome.Unsure, T("届いたか確かめています（送り直さないでください）", "Checking whether it went (don't send it again)")),
+            _ => (SendOutcome.NotSent, T("送れませんでした。もう一度送れます", "Couldn't send. You can try again")),
         };
     }
     catch (InvalidOperationException ex)
     {
-        answer = ex.Message;
+        (outcome, answer) = (SendOutcome.NotSent, ex.Message);
+    }
+    catch (IOException ex)
+    {
+        (outcome, answer) = (SendOutcome.NotSent, T($"ファイルが読めません（{ex.Message}）", $"Couldn't read the file ({ex.Message})"));
+    }
+    catch (ImsgException ex) when (ex.Code == "TIMEOUT" || ex.Status >= 500)
+    {
+        // 頼んだあとで返事が来なかった: 送れたかもしれない
+        (outcome, answer) = (SendOutcome.Unsure, T("返事が来ませんでした。届いたか確かめています（送り直さないでください）", "No answer. Checking whether it went (don't send it again)"));
     }
     catch (Exception ex)
     {
-        answer = ImsgClient.Explain(ex, T);
+        (outcome, answer) = (SendOutcome.NotSent, ImsgClient.Explain(ex, T));
     }
     lock (gate)
     {
-        sending = false;
-        if (answer != "sent") Say(answer, true);
+        if (outcome == SendOutcome.NotSent)
+        {
+            pendings.Remove(pending);
+            Say(answer, true);
+        }
+        else pending.State = outcome == SendOutcome.Sent ? "sent" : "checking";
         historyAt = null;
     }
     Draw();
-    // 送ったものが会話に出るよう、少し待って読み直す
-    _ = Task.Delay(1500).ContinueWith(_ => wake.Release());
-    return answer == "sent" ? "sent" : answer;
+    // 送ったものが会話に出るまで、しばらく詰めて読み直す（Messages のデータベースに書かれるまで少しかかる）
+    if (outcome != SendOutcome.NotSent)
+        foreach (var ms in new[] { 1200, 3000, 6000, 10000, 16000, 25000 })
+            _ = Task.Delay(ms).ContinueWith(_ => { lock (gate) historyAt = null; wake.Release(); });
+    return (outcome, answer);
+}
+
+/// <summary>会話に出た送ったもの（自分の、同じ文の、送った少し前より後のもの）を、送信中の吹き出しから外す。古いものも外す。</summary>
+void SettlePendings(string chatKey, List<JsonObject> history)
+{
+    var now = DateTimeOffset.UtcNow;
+    foreach (var p in pendings.Where(p => p.ChatKey == chatKey).ToList())
+    {
+        // 文があれば同じ文の、ファイルだけなら添付のある、自分の新しいもの
+        var landed = history.Any(m => m["isFromMe"]?.GetValue<bool>() == true
+            && (p.Text.Trim().Length > 0 ? (Str(m, "text") ?? "").Trim() == p.Text.Trim() : (m["attachments"] as JsonArray)?.Count > 0)
+            && (Time(Str(m, "createdAt")) is not { } at || at >= p.At.AddMinutes(-2)));
+        if (landed) pendings.Remove(p);
+        // 届いたと返事があったのに 2 分出てこなければ、出ていないだけとみて外す
+        else if (p.State == "sent" && now - p.At > TimeSpan.FromMinutes(2)) pendings.Remove(p);
+        // 分からないまま 1 分たったら、確かめてもらう（10 分で外す）
+        else if (p.State == "checking" && now - p.At > TimeSpan.FromMinutes(1)) p.State = "unknown";
+        else if (p.State == "unknown" && now - p.At > TimeSpan.FromMinutes(10)) pendings.Remove(p);
+    }
 }
 
 // --- 設定 ---
@@ -474,15 +585,67 @@ void OnEvent(string id)
         if (chat != null) Select(chat);
         return;
     }
+    if (id.StartsWith("unattach:") && int.TryParse(id[9..], out var ui))
+    {
+        lock (gate) if (ui < attached.Count) attached.RemoveAt(ui);
+        Draw();
+        return;
+    }
+    if (id.StartsWith("pick:") && int.TryParse(id[5..], out var pi))
+    {
+        lock (gate)
+        {
+            if (pickerFiles != null && pi < pickerFiles.Count)
+            {
+                var f = pickerFiles[pi];
+                if (attached.Contains(f)) attached.Remove(f);
+                else Attach([f]);
+            }
+        }
+        Draw();
+        return;
+    }
     switch (id)
     {
         case "send":
             string text;
-            lock (gate) text = compose;
-            if (text.Trim().Length == 0) return;
-            lock (gate) compose = "";
+            lock (gate)
+            {
+                text = compose;
+                if (text.Trim().Length == 0 && attached.Count == 0) return;
+                compose = "";
+            }
             app.SetInput("compose", "");
             _ = SendText(text);
+            break;
+        case "attach":
+            lock (gate) pickerOpen = !pickerOpen;
+            if (pickerOpen) LoadPicker();
+            Draw();
+            break;
+        case "picker_close":
+            lock (gate) pickerOpen = false;
+            Draw();
+            break;
+        case "picker_photos":
+        case "picker_files":
+            lock (gate)
+            {
+                pickerTab = id[7..];
+                pickerPage = 0;
+            }
+            LoadPicker();
+            Draw();
+            break;
+        case "picker_prev":
+            lock (gate) pickerPage = Math.Max(0, pickerPage - 1);
+            LoadPicker();
+            Draw();
+            break;
+        case "picker_more":
+            lock (gate) pickerPage++;
+            LoadPicker();
+            Draw();
             break;
         case "refresh":
             lock (gate) historyAt = null;
@@ -516,14 +679,17 @@ void Say(string text, bool error)
 
 void Draw()
 {
-    string main, left, bottom, top, describe;
-    bool sendMain, sendLeft, sendBottom, sendTop;
+    string main, left, bottom, top, popup, describe;
+    bool sendMain, sendLeft, sendBottom, sendTop, sendPopup;
     lock (gate)
     {
         main = Main().ToJsonString();
         left = ChatList().ToJsonString();
         bottom = ComposeBar().ToJsonString();
         top = TopBar().ToJsonString();
+        popup = (pickerOpen && client != null && !settingsOpen && Selected() != null ? Picker() : new JsonObject()).ToJsonString();
+        sendPopup = popup != sentPopup;
+        sentPopup = popup;
         describe = Describe();
         sendMain = main != sentMain;
         sendLeft = left != sentLeft;
@@ -535,9 +701,9 @@ void Draw()
         sentTop = top;
     }
     // 変わった板だけ送る（入力欄のある下の板を送り直さなければ、打っている欄はそのまま）
-    if (sendMain || sendLeft || sendBottom || sendTop)
+    if (sendMain || sendLeft || sendBottom || sendTop || sendPopup)
         app.Render(sendMain ? JsonNode.Parse(main) : null, sendLeft ? JsonNode.Parse(left) : null, sendBottom ? JsonNode.Parse(bottom) : null,
-            null, sendTop ? JsonNode.Parse(top) : null);
+            null, sendTop ? JsonNode.Parse(top) : null, sendPopup ? JsonNode.Parse(popup) : null);
     app.Describe(describe);
 }
 
@@ -586,11 +752,15 @@ JsonObject Face(JsonObject chat, float size)
     return Initial(Str(chat, "name") ?? "?", size);
 }
 
+/// <summary>顔の絵の無い人の丸（頭文字。電話番号・メールなら人の形）。絵にして覚えておく。</summary>
 JsonObject Initial(string name, float size)
 {
-    var first = name.TrimStart('+', ' ', '(').Length > 0 ? new StringInfo(name.TrimStart('+', ' ', '(')).SubstringByTextElements(0, 1).ToUpperInvariant() : "?";
-    if (char.IsDigit(first[0])) return Ui.Column(Ui.Icon("person", "dim").Align("center")).Width(size).Pad(0, (size - 44) / 2).Background("field", size / 2);
-    return Ui.Column(Ui.Text(first, bold: true).TextAlign("center").Align("center")).Width(size).Pad(0, (size - 40) / 2).Background("field", size / 2);
+    var trimmed = name.TrimStart('+', ' ', '(');
+    var first = trimmed.Length > 0 ? new StringInfo(trimmed).SubstringByTextElements(0, 1).ToUpperInvariant() : "";
+    if (first.Length > 0 && (char.IsDigit(first[0]) || name.Contains('@'))) first = "";
+    var key = $"ini:{first}:{name}:{size}";
+    if (!pictures.TryGetValue(key, out var data)) pictures[key] = data = Pictures.Initial(first, name, (int)size * 2);
+    return Ui.Image(data!, size, size, size / 2);
 }
 
 static string? FaceId(JsonObject chat) => (chat["faces"] as JsonArray ?? []).Select(x => x?.GetValue<string>()).FirstOrDefault(x => x != null);
@@ -637,7 +807,8 @@ JsonObject Settings()
 
 JsonObject Conversation(JsonObject chat)
 {
-    if (messages.Count == 0)
+    var mineWaiting = pendings.Where(p => p.ChatKey == selectedKey).ToList();
+    if (messages.Count == 0 && mineWaiting.Count == 0)
         return Ui.Column(Ui.Spacer(200), Ui.Text(loadingHistory || historyFor != selectedId ? T("読んでいます", "Loading") : T("まだやりとりがありません", "No messages yet"), color: "dim").Align("center")).Grow();
     var group = chat["isGroup"]?.GetValue<bool>() == true;
     var items = new List<JsonNode>();
@@ -653,6 +824,7 @@ JsonObject Conversation(JsonObject chat)
         }
         items.Add(Bubble(m, group));
     }
+    foreach (var p in mineWaiting) items.Add(PendingBubble(p));
     return Ui.Scroll(Ui.Column([.. items]).Gap(10).Pad(28, 8), "msgs:" + selectedKey, bottom: true).Grow();
 }
 
@@ -695,6 +867,150 @@ JsonObject Bubble(JsonObject m, bool group)
         : Ui.Row(stack, Ui.Spacer(140)).Gap(0);
 }
 
+// --- ファイルを選ぶ小窓（下の帯の上に浮かぶ） ---
+
+const int PickerPage = 12;
+
+/// <summary>写真（ピクチャ・デスクトップ・ダウンロードの絵、VRChat の写真も）か、ほかのファイル（ダウンロード・デスクトップ・ドキュメント）を、新しい順に読む。</summary>
+void LoadPicker()
+{
+    string tab;
+    int page;
+    lock (gate)
+    {
+        tab = pickerTab;
+        page = pickerPage;
+        pickerFiles = null;
+    }
+    _ = Task.Run(() =>
+    {
+        string Folder(Environment.SpecialFolder f) => Environment.GetFolderPath(f);
+        var home = Folder(Environment.SpecialFolder.UserProfile);
+        var roots = tab == "photos"
+            ? new[] { Folder(Environment.SpecialFolder.MyPictures), Folder(Environment.SpecialFolder.DesktopDirectory), Path.Combine(home, "Downloads") }
+            : new[] { Path.Combine(home, "Downloads"), Folder(Environment.SpecialFolder.DesktopDirectory), Folder(Environment.SpecialFolder.MyDocuments) };
+        var found = new List<FileInfo>();
+        foreach (var root in roots.Where(Directory.Exists).Distinct())
+            Scan(new DirectoryInfo(root), 0, found, tab == "photos");
+        var all = found.OrderByDescending(f => f.LastWriteTimeUtc).Select(f => f.FullName).Distinct().ToList();
+        var list = all.Skip(PickerPage * page).Take(PickerPage).ToList();
+        lock (gate)
+        {
+            if (tab != pickerTab) return;
+            pickerFiles = list;
+            pickerMore = all.Count > PickerPage * (page + 1);
+            foreach (var f in list.Where(IsImage)) WantThumb(f);
+        }
+        Draw();
+    });
+}
+
+/// <summary>フォルダを 3 段まで見る（大きなフォルダで止まらないよう、全部で 4000 個まで）。</summary>
+static void Scan(DirectoryInfo dir, int depth, List<FileInfo> found, bool images)
+{
+    if (found.Count > 4000) return;
+    try
+    {
+        foreach (var f in dir.EnumerateFiles())
+        {
+            if (f.Attributes.HasFlag(FileAttributes.Hidden) || f.Length == 0 || f.Length > MaxFileBytes) continue;
+            if (IsImage(f.FullName) == images) found.Add(f);
+        }
+        if (depth >= 3) return;
+        foreach (var d in dir.EnumerateDirectories())
+            if (!d.Attributes.HasFlag(FileAttributes.Hidden) && !d.Name.StartsWith('.') && d.Name != "node_modules")
+                Scan(d, depth + 1, found, images);
+    }
+    catch (Exception)
+    {
+        // 読めないフォルダは飛ばす
+    }
+}
+
+static bool IsImage(string path) => Path.GetExtension(path).ToLowerInvariant() is ".jpg" or ".jpeg" or ".png" or ".gif" or ".heic" or ".webp" or ".bmp";
+
+/// <summary>この PC の写真の小さな絵を作る（作れたら描き直す）。</summary>
+void WantThumb(string path)
+{
+    var key = "thumb:" + path;
+    if (pictures.ContainsKey(key)) return;
+    pictures[key] = null;
+    _ = Task.Run(() =>
+    {
+        string? data = null;
+        try
+        {
+            data = Pictures.FileThumb(path, 240);
+        }
+        catch (Exception)
+        {
+            // 読めなければアイコンのまま
+        }
+        lock (gate) pictures[key] = data;
+        Draw();
+    });
+}
+
+JsonObject Picker()
+{
+    var tabs = Ui.Row(
+        Ui.Button("picker_photos", T("写真", "Photos"), "image", pickerTab == "photos" ? "selected" : null, small: true),
+        Ui.Button("picker_files", T("ファイル", "Files"), "description", pickerTab == "files" ? "selected" : null, small: true),
+        Ui.Spacer().Grow(),
+        Ui.Button("picker_close", icon: "close", small: true, tip: T("閉じる", "Close"))).Gap(8);
+    var items = new List<JsonNode> { tabs };
+    if (pickerFiles == null) items.Add(Ui.Text(T("探しています", "Looking"), color: "dim"));
+    else if (pickerFiles.Count == 0) items.Add(Ui.Text(tabTextEmpty(), color: "dim"));
+    else if (pickerTab == "photos")
+    {
+        var cells = pickerFiles.Select((f, i) =>
+        {
+            var on = attached.Contains(f);
+            var thumb = pictures.GetValueOrDefault("thumb:" + f) is { } t ? Ui.Image(t, 170, 170, 16) : (JsonNode)Ui.Column(Ui.Icon("image", "dim").Align("center")).Pad(0, 60);
+            var cell = Ui.Column(thumb, Ui.Text(on ? T("添える", "Attached") : Path.GetFileName(f), "small", on ? "accent" : "dim").OneLine()).Gap(4).Pad(6).OnPress("pick:" + i);
+            if (on) cell["background"] = "accent";
+            return (JsonNode)cell.Grow();
+        }).ToList();
+        items.AddRange(cells.Chunk(4).Select(r => (JsonNode)Ui.Row([.. r]).Gap(8)));
+    }
+    else
+        items.AddRange(pickerFiles.Select((f, i) =>
+        {
+            var on = attached.Contains(f);
+            var row = Ui.Row(Ui.Icon(on ? "check_circle" : "description", on ? "accent" : "dim").Align("center"),
+                Ui.Column(Ui.Text(Path.GetFileName(f)).OneLine(), Ui.Text(Path.GetDirectoryName(f) ?? "", "small", "faint").OneLine()).Gap(0).Grow()).Gap(12).Pad(12, 8).OnPress("pick:" + i);
+            if (on) row["background"] = "accent";
+            return (JsonNode)row;
+        }));
+    // 12 個ずつめくる（小窓が窓より高くならないように）
+    if (pickerPage > 0 || pickerMore)
+        items.Add(Ui.Row(
+            pickerPage > 0 ? Ui.Button("picker_prev", T("新しい方へ", "Newer"), "chevron_left", small: true) : Ui.Spacer(),
+            Ui.Spacer().Grow(),
+            pickerMore ? Ui.Button("picker_more", T("古い方へ", "Older"), "chevron_right", small: true) : Ui.Spacer()).Gap(8));
+    return Ui.Column([.. items]).Gap(10).Width(820);
+
+    string tabTextEmpty() => pickerTab == "photos" ? T("写真が見つかりません", "No photos found") : T("ファイルが見つかりません", "No files found");
+}
+
+/// <summary>送って、まだ会話に出てこない吹き出し（右に、下に様子）。</summary>
+JsonObject PendingBubble(Pending p)
+{
+    var inside = new List<JsonNode>();
+    if (p.Files > 0) inside.Add(Ui.Row(Ui.Icon("attach_file", "dim"), Ui.Text(T($"ファイル {p.Files} 件", $"{p.Files} file(s)"), "small", "dim")).Gap(8));
+    if (p.Text.Trim().Length > 0) inside.Add(Ui.Text(p.Text));
+    var bubble = Ui.Column([.. inside]).Gap(8).Pad(22, 14).Background("accent", 30);
+    var (label, color) = p.State switch
+    {
+        "sending" => (T("送信中…", "Sending…"), "faint"),
+        "sent" => (T("送信済み", "Sent"), "faint"),
+        "checking" => (T("届いたか確かめています", "Checking whether it went"), "warning"),
+        _ => (T("届いたか分かりません。Messages で確かめてください", "Not sure it went. Check in Messages"), "warning"),
+    };
+    var stack = Ui.Column(bubble.Align("end"), Ui.Text(label, "small", color).Align("end")).Gap(4).Grow();
+    return Ui.Row(Ui.Spacer(140), stack).Gap(0);
+}
+
 JsonObject ComposeBar()
 {
     if (client == null || settingsOpen)
@@ -703,9 +1019,22 @@ JsonObject ComposeBar()
         return Ui.Row(Ui.Text(T("会話を選ぶと、ここから返事を送れます", "Pick a conversation to reply"), color: "dim").Grow().Align("center")).Pad(24, 0);
     if (sendMode == "off")
         return Ui.Row(Ui.Icon("lock", "dim").Align("center"), Ui.Text(T("読むだけのトークンなので送れません", "Read-only token: sending is off"), color: "dim").Grow().Align("center")).Gap(12).Pad(24, 0);
-    return Ui.Row(
-        Ui.Input("compose", sendMode == "dry-run" ? T("iMessage（試しのモード）", "iMessage (dry run)") : "iMessage", 1).Grow().Align("center"),
-        Ui.Button("send", icon: sending ? "hourglass_top" : "arrow_upward", style: "primary", tip: T("送る", "Send")).Align("center")).Gap(12);
+    var bar = Ui.Row(
+        Ui.Button("attach", icon: "add", style: pickerOpen ? "selected" : null, tip: T("ファイルを添える", "Attach files")).Align("end"),
+        // 長い文は折り返して帯ごと上へ伸びる（1 行のままだと、はみ出した所へカーソルを動かせなかった）
+        Ui.Input("compose", sendMode == "dry-run" ? T("iMessage（試しのモード）", "iMessage (dry run)") : "iMessage", 5).Grow().Align("end"),
+        Ui.Button("send", icon: "arrow_upward", style: "primary", tip: T("送る", "Send")).Align("end")).Gap(12);
+    if (attached.Count == 0) return bar;
+    // 添えるファイルの札（写真は小さな絵、ほかはアイコンと名前。× で外す）
+    var chips = attached.Select((f, i) =>
+    {
+        var face = IsImage(f) && pictures.GetValueOrDefault("thumb:" + f) is { } t ? Ui.Image(t, 56, 56, 12) : Ui.Icon("description", "dim").Align("center");
+        return (JsonNode)Ui.Row(face, Ui.Text(Path.GetFileName(f), "small").OneLine().Grow().Align("center"), Ui.Button("unattach:" + i, icon: "close", small: true).Align("center"))
+            .Gap(8).Pad(8, 6).Background("field", 20);
+    }).ToArray();
+    var rows = chips.Chunk(3).Select(r => (JsonNode)Ui.Row([.. r.Select(c => ((JsonObject)c!).Grow())]).Gap(8)).ToList();
+    rows.Add(bar);
+    return Ui.Column([.. rows]).Gap(10).Grow();
 }
 
 string Describe()
@@ -759,3 +1088,15 @@ static string? Str(JsonNode? o, string key) => o?[key] is JsonValue v && v.TryGe
 
 // 会話を epoch をまたいで見分ける（id は epoch ごとに変わる）
 static string Key(JsonObject chat) => $"{Str(chat, "name")}|{Str(chat, "service")}|{chat["isGroup"]}";
+
+enum SendOutcome { Sent, Unsure, NotSent }
+
+/// <summary>送って、まだ会話に出てこないもの。State: sending・sent・checking（届いたか分からない返事）・unknown（1 分たっても出てこない）。</summary>
+sealed class Pending(string chatKey, string text, DateTimeOffset at, int files)
+{
+    public int Files => files;
+    public string ChatKey => chatKey;
+    public string Text => text;
+    public DateTimeOffset At => at;
+    public string State { get; set; } = "sending";
+}

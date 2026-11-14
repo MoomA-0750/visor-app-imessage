@@ -53,6 +53,7 @@ CHATS = [
     {"id": "c2", "name": "キャンプの会", "service": "iMessage", "isGroup": True, "unreadCount": 0, "faces": ["f2", None]},
     {"id": "c3", "name": "+81 90-1234-5678", "service": "SMS", "isGroup": False, "unreadCount": 0, "faces": []},
 ]
+UPLOADS = {}
 PICTURES = {"f1": png(96, 96, (240, 160, 90)), "f2": png(96, 96, (90, 170, 240)), "a1": png(480, 320, (120, 200, 140))}
 
 
@@ -102,8 +103,24 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.authorized():
             return
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+        raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        if self.path.startswith("/api/uploads"):
+            uid = f"u{len(UPLOADS) + 1}"
+            UPLOADS[uid] = raw
+            print("上げた:", uid, len(raw), flush=True)
+            return self.reply(200, {"uploadId": uid, "bytes": len(raw), "name": "f"})
+        body = json.loads(raw or b"{}")
         if self.path == "/api/send":
+            for uid in body.get("uploadIds", []):
+                if uid not in UPLOADS:
+                    return self.reply(409, {"code": "UPLOAD_UNKNOWN"})
+                PICTURES[uid] = UPLOADS.pop(uid)
+                chat = body.get("chatId")
+                if chat in HISTORY:
+                    HISTORY[chat].append({**msg(100 + len(HISTORY[chat]), "", True, 0, attachments=[{"id": uid, "kind": "image", "sticker": False, "preview": False}]),
+                                          "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")})
+            if not body.get("text") and body.get("uploadIds"):
+                return self.reply(200, {"state": "sent", "sent": len(body["uploadIds"]), "total": len(body["uploadIds"])})
             chat = body.get("chatId")
             if chat not in HISTORY:
                 return self.reply(409, {"code": "STALE_CHAT"})

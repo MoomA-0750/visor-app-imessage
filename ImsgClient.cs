@@ -53,36 +53,55 @@ sealed class ImsgClient : IDisposable
                 return chain.Build(new X509Certificate2(cert));
             };
         }
-        _http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) };
+        // 待つ長さは頼みごとごとに決める（読むのは 20 秒、送るのは 75 秒、ファイルを上げるのは 5 分）
+        _http = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
         _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
         _http.DefaultRequestHeaders.UserAgent.ParseAdd("visor-imessage/0.1");
     }
 
     public async Task<JsonObject> GetJson(string path, CancellationToken ct = default)
     {
-        using var res = await Send(new HttpRequestMessage(HttpMethod.Get, new Uri(_base, path)), ct);
+        using var res = await Send(new HttpRequestMessage(HttpMethod.Get, new Uri(_base, path)), ct, ReadTimeout);
         return JsonNode.Parse(await res.Content.ReadAsStringAsync(ct)) as JsonObject ?? throw new ImsgException(0, null, "bad response");
     }
 
     public async Task<(byte[] Bytes, string Type)> GetBytes(string path, CancellationToken ct = default)
     {
-        using var res = await Send(new HttpRequestMessage(HttpMethod.Get, new Uri(_base, path)), ct);
+        using var res = await Send(new HttpRequestMessage(HttpMethod.Get, new Uri(_base, path)), ct, ReadTimeout);
         var bytes = await res.Content.ReadAsByteArrayAsync(ct);
         return (bytes, res.Content.Headers.ContentType?.MediaType ?? "");
     }
 
-    public async Task<JsonObject> PostJson(string path, JsonObject body, CancellationToken ct = default)
+    static readonly TimeSpan ReadTimeout = TimeSpan.FromSeconds(20);
+
+    /// <summary>ファイルを上げる（送る前に 1 つずつ）。返す uploadId を send の uploadIds に入れる。</summary>
+    public async Task<string> Upload(string name, Stream content, CancellationToken ct = default)
+    {
+        var req = new HttpRequestMessage(HttpMethod.Post, new Uri(_base, "api/uploads?name=" + Uri.EscapeDataString(name)))
+        {
+            Content = new StreamContent(content),
+        };
+        req.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        using var res = await Send(req, ct, TimeSpan.FromMinutes(5));
+        var o = JsonNode.Parse(await res.Content.ReadAsStringAsync(ct)) as JsonObject;
+        return o?["uploadId"]?.GetValue<string>() ?? throw new ImsgException(0, null, "bad response");
+    }
+
+    public async Task<JsonObject> PostJson(string path, JsonObject body, CancellationToken ct = default, TimeSpan? timeout = null)
     {
         var req = new HttpRequestMessage(HttpMethod.Post, new Uri(_base, path))
         {
             Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json"),
         };
-        using var res = await Send(req, ct);
+        using var res = await Send(req, ct, timeout ?? ReadTimeout);
         return JsonNode.Parse(await res.Content.ReadAsStringAsync(ct)) as JsonObject ?? throw new ImsgException(0, null, "bad response");
     }
 
-    async Task<HttpResponseMessage> Send(HttpRequestMessage req, CancellationToken ct)
+    async Task<HttpResponseMessage> Send(HttpRequestMessage req, CancellationToken outer, TimeSpan timeout)
     {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(outer);
+        cts.CancelAfter(timeout);
+        var ct = cts.Token;
         HttpResponseMessage res;
         try
         {
@@ -96,7 +115,7 @@ sealed class ImsgClient : IDisposable
         {
             throw new ImsgException(0, "UNREACHABLE", ex.Message);
         }
-        catch (TaskCanceledException) when (!ct.IsCancellationRequested)
+        catch (OperationCanceledException) when (!outer.IsCancellationRequested)
         {
             throw new ImsgException(0, "TIMEOUT", "timeout");
         }
