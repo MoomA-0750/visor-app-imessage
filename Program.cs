@@ -966,7 +966,7 @@ JsonObject Picker()
         var cells = pickerFiles.Select((f, i) =>
         {
             var on = attached.Contains(f);
-            var thumb = pictures.GetValueOrDefault("thumb:" + f) is { } t ? Ui.Image(t, 170, 170, 16) : (JsonNode)Ui.Column(Ui.Icon("image", "dim").Align("center")).Pad(0, 60);
+            var thumb = pictures.GetValueOrDefault("thumb:" + f) is { } t ? Ui.Image(t, 170, 170, 16) : (JsonNode)Ui.Column(Ui.Icon("image", "dim").Align("center")).Pad(0, 63).Background("field", 16); // 絵と同じ 170 の高さ（名前の段をそろえる）
             var cell = Ui.Column(thumb, Ui.Text(on ? T("添える", "Attached") : Path.GetFileName(f), "small", on ? "accent" : "dim").OneLine()).Gap(4).Pad(6).OnPress("pick:" + i);
             if (on) cell["background"] = "accent";
             return (JsonNode)cell.Grow();
