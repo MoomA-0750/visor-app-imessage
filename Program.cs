@@ -1084,7 +1084,8 @@ string DayLabel(DateTimeOffset t)
     return days == 0 ? T("今日", "Today") : days == 1 ? T("昨日", "Yesterday") : lang == "en" ? t.ToString("ddd, MMM d", culture) : t.ToString("M月d日（ddd）", culture);
 }
 
-static string? Str(JsonNode? o, string key) => o?[key] is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
+// 文は合わせた形（NFC）にそろえる（Mac から来る文や連絡先の名前は、濁点を分けた形（か＋゛）のことがあり、字形がずれて見えた）
+static string? Str(JsonNode? o, string key) => o?[key] is JsonValue v && v.TryGetValue<string>(out var s) ? (s.IsNormalized() ? s : s.Normalize()) : null;
 
 // 会話を epoch をまたいで見分ける（id は epoch ごとに変わる）
 static string Key(JsonObject chat) => $"{Str(chat, "name")}|{Str(chat, "service")}|{chat["isGroup"]}";
