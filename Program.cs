@@ -166,9 +166,10 @@ async Task Poll()
         {
             await Refresh();
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            // Refresh の中で本人に見せる。ここでは回し続ける
+            // Refresh の中で本人に見せる。ここでは回し続ける（思わぬ失敗は visor のログに残す）
+            Console.Error.WriteLine($"poll: {ex}");
         }
         await wake.WaitAsync(app.IsVisible ? TimeSpan.FromSeconds(15) : TimeSpan.FromSeconds(60));
     }
@@ -195,24 +196,35 @@ async Task Refresh()
         {
             connectionError = null;
             var newEpoch = Str(snap, "epoch");
-            if (newEpoch != epoch)
+            var epochChanged = newEpoch != epoch;
+            if (epochChanged)
             {
-                // id が全部入れ替わった: 絵を捨て、選んでいた会話を名前で選び直す
+                // id が全部入れ替わった: 絵を捨て、選んでいた会話を名前で選び直す。新着の覚えも捨て、この回は知らせない
                 epoch = newEpoch;
                 pictures.Clear();
                 wanted.Clear();
                 historyFor = null;
+                lastSeen.Clear();
+                firstPoll = true;
             }
             chats = (snap["chats"] as JsonArray ?? []).OfType<JsonObject>().ToList();
-            if (selectedKey != null)
+            // 同じ id の会話がまだあればそのまま。id が変わったときだけ名前で選び直す（同じ名前の会話が 2 つあると、名前で選ぶと別の方へ移った）
+            if (selectedId != null && chats.Any(x => Str(x, "id") == selectedId)) { }
+            else if (selectedKey != null && epochChanged)
             {
                 var again = chats.FirstOrDefault(x => Key(x) == selectedKey);
                 selectedId = again != null ? Str(again, "id") : null;
                 if (again == null) selectedKey = null;
             }
+            else if (selectedId != null)
+            {
+                selectedId = null;
+                selectedKey = null;
+            }
             foreach (var chat in chats)
             {
-                var key = Key(chat);
+                // 新着の覚えは会話の id ごと（名前ごとにすると、同じ名前の会話（グループなど）の時刻が入れ替わり、毎回知らせていた）
+                var key = Str(chat, "id") ?? "";
                 var at = Str(chat, "lastMessageAt") ?? "";
                 var seen = lastSeen.GetValueOrDefault(key);
                 lastSeen[key] = at;
@@ -264,7 +276,7 @@ async Task LoadHistory(string id)
             if (selectedId != id) return;
             messages = list;
             historyFor = id;
-            if (selectedKey != null) SettlePendings(selectedKey, list);
+            SettlePendings(id, list);
             historyAt = chats.FirstOrDefault(x => Str(x, "id") == id) is { } sel ? Str(sel, "lastMessageAt") : null;
             foreach (var m in list.TakeLast(30))
             {
@@ -422,7 +434,7 @@ async Task<(SendOutcome, string)> Send(string chatId, string text, IReadOnlyList
         if (c == null) return (SendOutcome.NotSent, T("imsg-web につなぐ設定がまだありません", "Not set up yet"));
         if (sendMode == "off") return (SendOutcome.NotSent, T("このトークンでは送れません（読むだけのトークンです）", "This token can't send (it's read-only)"));
         var chat = chats.FirstOrDefault(x => Str(x, "id") == chatId);
-        pending = new Pending(chat != null ? Key(chat) : chatId, text, DateTimeOffset.UtcNow, files.Count);
+        pending = new Pending(chatId, text, DateTimeOffset.UtcNow, files.Count);
         pendings.Add(pending);
     }
     Draw();
@@ -491,10 +503,10 @@ async Task<(SendOutcome, string)> Send(string chatId, string text, IReadOnlyList
 }
 
 /// <summary>会話に出た送ったもの（自分の、同じ文の、送った少し前より後のもの）を、送信中の吹き出しから外す。古いものも外す。</summary>
-void SettlePendings(string chatKey, List<JsonObject> history)
+void SettlePendings(string chatId, List<JsonObject> history)
 {
     var now = DateTimeOffset.UtcNow;
-    foreach (var p in pendings.Where(p => p.ChatKey == chatKey).ToList())
+    foreach (var p in pendings.Where(p => p.ChatId == chatId).ToList())
     {
         // 文があれば同じ文の、ファイルだけなら添付のある、自分の新しいもの
         var landed = history.Any(m => m["isFromMe"]?.GetValue<bool>() == true
@@ -807,7 +819,7 @@ JsonObject Settings()
 
 JsonObject Conversation(JsonObject chat)
 {
-    var mineWaiting = pendings.Where(p => p.ChatKey == selectedKey).ToList();
+    var mineWaiting = pendings.Where(p => p.ChatId == selectedId).ToList();
     if (messages.Count == 0 && mineWaiting.Count == 0)
         return Ui.Column(Ui.Spacer(200), Ui.Text(loadingHistory || historyFor != selectedId ? T("読んでいます", "Loading") : T("まだやりとりがありません", "No messages yet"), color: "dim").Align("center")).Grow();
     var group = chat["isGroup"]?.GetValue<bool>() == true;
@@ -1085,7 +1097,35 @@ string DayLabel(DateTimeOffset t)
 }
 
 // 文は合わせた形（NFC）にそろえる（Mac から来る文や連絡先の名前は、濁点を分けた形（か＋゛）のことがあり、字形がずれて見えた）
-static string? Str(JsonNode? o, string key) => o?[key] is JsonValue v && v.TryGetValue<string>(out var s) ? (s.IsNormalized() ? s : s.Normalize()) : null;
+static string? Str(JsonNode? o, string key) => o?[key] is JsonValue v && v.TryGetValue<string>(out var s) ? Clean(s) : null;
+
+// 途中で切った文（最後の文の抜き出しなど）は、絵文字の片割れ（対になっていないサロゲート）で終わることがあり、そのままだと NFC にできずに例外になった。
+// 片割れは捨ててからそろえる
+static string Clean(string s)
+{
+    if (s.Length == 0) return s;
+    var broken = false;
+    for (var i = 0; i < s.Length && !broken; i++)
+        if (char.IsHighSurrogate(s[i]) ? i + 1 >= s.Length || !char.IsLowSurrogate(s[++i]) : char.IsLowSurrogate(s[i])) broken = true;
+    if (broken)
+    {
+        var sb = new StringBuilder(s.Length);
+        for (var i = 0; i < s.Length; i++)
+        {
+            if (char.IsHighSurrogate(s[i]) && i + 1 < s.Length && char.IsLowSurrogate(s[i + 1])) sb.Append(s[i]).Append(s[++i]);
+            else if (!char.IsSurrogate(s[i])) sb.Append(s[i]);
+        }
+        s = sb.ToString();
+    }
+    try
+    {
+        return s.IsNormalized() ? s : s.Normalize();
+    }
+    catch (ArgumentException)
+    {
+        return s;
+    }
+}
 
 // 会話を epoch をまたいで見分ける（id は epoch ごとに変わる）
 static string Key(JsonObject chat) => $"{Str(chat, "name")}|{Str(chat, "service")}|{chat["isGroup"]}";
@@ -1093,10 +1133,10 @@ static string Key(JsonObject chat) => $"{Str(chat, "name")}|{Str(chat, "service"
 enum SendOutcome { Sent, Unsure, NotSent }
 
 /// <summary>送って、まだ会話に出てこないもの。State: sending・sent・checking（届いたか分からない返事）・unknown（1 分たっても出てこない）。</summary>
-sealed class Pending(string chatKey, string text, DateTimeOffset at, int files)
+sealed class Pending(string chatId, string text, DateTimeOffset at, int files)
 {
     public int Files => files;
-    public string ChatKey => chatKey;
+    public string ChatId => chatId;
     public string Text => text;
     public DateTimeOffset At => at;
     public string State { get; set; } = "sending";
